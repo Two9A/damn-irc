@@ -1,0 +1,602 @@
+#!/usr/bin/env php
+<?php
+
+require_once dirname(__FILE__).'/html5/html5.inc.php';
+
+$options = getopt('hvH:p:l:', array('help', 'verbose', 'host:', 'port:', 'log:'));
+if (isset($options['h']) || isset($options['help'])) {
+    fprintf(STDERR, join("\n", array(
+        "Two9A's dAmn-IRC bridge, v0.01",
+        "Options:",
+        "    -h, --help:        Display this message",
+        "    -v, --verbose:     Log detailed network traffic",
+        "    -l, --log:         Where to write log entries [stderr]",
+        "    -H, --host:        Host for IRC connections [localhost]",
+        "    -p, --port:        Port for IRC connections [8193]\n"
+    )));
+    return;
+}
+
+$params = array();
+if (isset($options['v']) || isset($options['verbose'])) {
+    $params['verbose'] = true;
+}
+if (isset($options['H']) || isset($options['host'])) {
+    $params['irc_host'] = isset($options['H']) ? $options['H'] : $options['host'];
+}
+if (isset($options['p']) || isset($options['port'])) {
+    $params['irc_port'] = isset($options['p']) ? $options['p'] : $options['port'];
+}
+if (isset($options['l']) || isset($options['log'])) {
+    $params['log_file'] = isset($options['l']) ? $options['l'] : $options['log'];
+}
+$di = new dAmn_IRC($params);
+
+class dAmn_IRC {
+    protected $options = array(
+        'irc_host' => 'localhost',
+        'irc_port' => 8193,
+        'verbose'  => false,
+        'log_file' => 'php://stderr'
+    );
+
+    const DAMN_HOST = 'chat.deviantart.com';
+    const DAMN_PORT = 3900;
+
+    const IRC_SOCK = 0;
+    const DAMN_SOCK = 1;
+
+    protected $ircsock;
+
+    protected $listen_sockets;
+
+    protected $damnnick;
+    protected $damnpass;
+    protected $damncookie;
+
+    protected $channel_data;
+    protected $damn_currchan;
+
+    protected $last_ping;
+
+    public function __construct($options) {
+        $this->options = array_merge($this->options, $options);
+
+        $this->ircsock = stream_socket_server(
+            sprintf('tcp://%s:%s', $this->options['irc_host'], $this->options['irc_port']),
+            $errno, $errmsg
+        );
+        if (!$this->ircsock) {
+            throw new Exception($errmsg, $errno);
+        }
+
+        $this->listen();
+    }
+
+    protected function debug($type, $str, $debug = false) {
+        if (!$debug || $this->options['verbose']) {
+            $lp = fopen($this->options['log_file'], 'a');
+            fprintf($lp, "[%s][%s] %s\n", date('YmdHis'), $type, $str);
+            fclose($lp);
+        }
+    }
+
+    public function listen() {
+        $this->debug('IRC', 'Listening on '.$this->options['irc_host'].':'.$this->options['irc_port']);
+        while (1) {
+            $this->listen_sockets[self::IRC_SOCK] = @stream_socket_accept($this->ircsock);
+
+            if ($this->listen_sockets[self::IRC_SOCK]) {
+                stream_set_blocking($this->listen_sockets[self::IRC_SOCK], false);
+                $this->debug('IRC', 'Client connected');
+
+                while (isset($this->listen_sockets[self::IRC_SOCK])) {
+                    $sockets = $this->listen_sockets;
+                    stream_select($sockets, $sockets, $sockets, null);
+
+                    $line = $this->readline_irc();
+                    if ($line && strlen($line)) {
+                        $this->debug('IRC<-', $line, true);
+                        $cmd = substr($line, 0, strpos($line, ' '));
+                        $msg = substr($line, strpos($line, ' ') + 1);
+
+                        call_user_func_array(array($this, 'irc_'.$cmd), array($msg));
+                    }
+
+                    if (isset($this->listen_sockets[self::DAMN_SOCK])) {
+                        $line = $this->readline_damn();
+                        if ($line && strlen($line)) {
+                            $this->debug('DAMN<-', $line, true);
+                            if (strpos($line, ' ') === false) {
+                                $cmd = $line;
+                                $msg = null;
+                            } else {
+                                $cmd = substr($line, 0, strpos($line, ' '));
+                                $msg = substr($line, strpos($line, ' ') + 1);
+                            }
+
+                            call_user_func_array(array($this, 'damn_'.$cmd), array($msg));
+                        }
+                    }
+
+                    usleep(2000);
+                }
+                $this->debug('IRC', 'Client quit');
+            }
+        }
+    }
+
+    protected function parse_cookies($headers) {
+        $cookies = array();
+        foreach (explode("\r\n", $headers) as $header) {
+            $parts = explode(':', $header);
+            if (count($parts) >= 2) {
+                $h = strtolower(trim($parts[0]));
+                $v = trim($parts[1]);
+                if ($h == 'set-cookie') {
+                    $cookies[] = substr($v, 0, strpos($v, ';'));
+                }
+            }
+        }
+
+        return $cookies;
+    }
+
+    protected function login() {
+        $this->out_irc(null, 'NOTICE', 'AUTH', 'Fetching token...');
+
+        // Step 1: Fetch the login form
+        $c = curl_init();
+        $options = array(
+            CURLOPT_URL => 'https://www.deviantart.com/users/login',
+            CURLOPT_HEADER => true,
+            CURLOPT_TIMEOUT => 5,
+            CURLOPT_USERAGENT => 'dAmn/IRC-Bridge-0.01',
+            CURLOPT_RETURNTRANSFER => true,
+            CURLOPT_FOLLOWLOCATION => true,
+            CURLOPT_SSL_VERIFYPEER => false,
+        );
+        curl_setopt_array($c, $options);
+        $r = curl_exec($c);
+        curl_close($c);
+
+        list($headers, $body) = explode("\r\n\r\n", $r);
+        $html = new \Masterminds\HTML5();
+        $dom = $html->loadHTML($body);
+        $qp = qp($dom);
+
+        // Step 2: Copy the CSRF values from the form, and login
+        $c = curl_init();
+        $options += array(
+            CURLOPT_POST => true,
+            CURLOPT_HTTPHEADER => array(
+                'Cookie: ' . join('; ', $this->parse_cookies($headers))
+            ),
+            CURLOPT_POSTFIELDS => http_build_query(array(
+                'username' => $this->damnnick,
+                'password' => $this->damnpass,
+                'remember_me' => '1',
+                'validate_token' => $qp->top('[name="validate_token"]')->attr('value'),
+                'validate_key' => $qp->top('[name="validate_key"]')->attr('value')
+            ))
+        );
+        curl_setopt_array($c, $options);
+        $r = curl_exec($c);
+        curl_close($c);
+
+        list($headers, $body) = explode("\r\n\r\n", $r);
+
+        $this->out_irc(null, 'NOTICE', 'AUTH', 'Logged in to DeviantArt.');
+
+        // Step 3: Pull the dAmn cookie
+        // Assumes the password was correct
+        $c = curl_init();
+        curl_setopt_array($c, array(
+            CURLOPT_URL => 'http://chat.deviantart.com/chat/Botdom',
+            CURLOPT_USERAGENT => 'dAmn/IRC-Bridge-0.01',
+            CURLOPT_HTTPHEADER => array(
+                'Cookie: ' . join('; ', $this->parse_cookies($headers))
+            ),
+            CURLOPT_RETURNTRANSFER => true,
+            CURLOPT_FOLLOWLOCATION => true,
+            CURLOPT_TIMEOUT => 5,
+        ));
+        $r = curl_exec($c);
+        curl_close($c);
+
+        preg_match('#dAmn_Login\(\s*"\S+"\s*,\s*"([0-9a-f]+)"\s*\)#', $r, $matches);
+        $this->damncookie = $matches[1];
+        $this->debug('DAMN', 'Got login cookie: '.$this->damncookie);
+
+        $this->out_irc(null, 'NOTICE', 'AUTH', 'Authenticated.');
+
+        $this->listen_sockets[self::DAMN_SOCK] = stream_socket_client(
+            sprintf('tcp://%s:%s', self::DAMN_HOST, self::DAMN_PORT),
+            $errno, $errmsg
+        );
+        if (!$this->listen_sockets[self::DAMN_SOCK]) {
+            throw new Exception($errmsg, $errno);
+        }
+
+        stream_set_blocking($this->listen_sockets[self::DAMN_SOCK], false);
+        $this->debug('DAMN', 'Connected.');
+
+        $this->out_damn('dAmnClient', "0.3\nagent=dAmn/IRC Bridge 0.01");
+    }
+
+    public function __call($name, $args) {
+        list($protocol, $msg) = explode('_', $name);
+        switch (strtoupper($protocol)) {
+            case 'IRC':
+                switch (strtoupper($msg)) {
+                    case 'PASS':
+                        $this->damnpass = $args[0];
+                        break;
+
+                    case 'NICK':
+                        $this->damnnick = $args[0];
+                        break;
+
+                    case 'USER':
+                        $this->out_irc(null, '001', $this->damnnick, sprintf("Welcome to dAmn/IRC bridge %s!%s@%s", $this->damnnick, $this->damnnick, self::DAMN_HOST));
+                        $this->out_irc(null, '002', $this->damnnick, "PREFIX=(qov)~@+");
+                        $this->out_irc(null, '375', $this->damnnick, sprintf(":- %s MOTD -", self::DAMN_HOST));
+                        $this->out_irc(null, '376', $this->damnnick, ":End of MOTD");
+
+                        $this->login();
+                        break;
+
+                    case 'JOIN':
+                        $channels = explode(',', $args[0]);
+                        foreach ($channels as $chan) {
+                            $this->out_damn('join', $this->to_room($chan));
+                        }
+                        break;
+
+                    case 'PART':
+                        $channels = explode(',', $args[0]);
+                        foreach ($channels as $chan) {
+                            $this->out_damn('part', $this->to_room($chan));
+                        }
+                        break;
+
+                    case 'PRIVMSG':
+                        $channel = substr($args[0], 0, strpos($args[0], ':'));
+                        $str = substr($args[0], strpos($args[0], ':') + 1);
+
+                        if (strpos($str, "\001ACTION") === 0) {
+                            $str = strtr($str, array(
+                                "\001ACTION" => '',
+                                "\001" => ''
+                            ));
+                            $this->out_damn('send', sprintf("%s\n\naction main\n\n%s", $this->to_room($channel), $str));
+                        } else {
+                            $this->out_damn('send', sprintf("%s\n\nnpmsg main\n\n%s", $this->to_room($channel), $str));
+                        }
+                        break;
+
+                    case 'PING':
+                        $this->out_irc(null, 'PONG', self::DAMN_HOST, $args[0]);
+                        if (($this->last_ping + 300) >= time()) {
+                            break;
+                        }
+
+                        // We timed out from dAmn
+                        $this->out_irc(null, 'NOTICE', 'AUTH', 'Timed out.');
+                        // FALLTHROUGH
+                    case 'QUIT':
+                        fclose($this->listen_sockets[self::IRC_SOCK]);
+                        fclose($this->listen_sockets[self::DAMN_SOCK]);
+                        $this->listen_sockets = array();
+                        $this->channel_data = array();
+                        break;
+                }
+                break;
+            case 'DAMN':
+                switch (strtoupper($msg)) {
+                    case 'DAMNSERVER':
+                        $this->out_damn(
+                            'login',
+                            sprintf("%s\npk=%s", $this->damnnick, $this->damncookie)
+                        );
+                        break;
+
+                    case 'LOGIN':
+                        // Error messages
+                        while ($line = $this->readline_damn()) {
+                            $this->debug('DAMN-LOGIN', $line);
+                        }
+                        // User properties
+                        while ($line = $this->readline_damn()) {
+                            $this->debug('DAMN-LOGIN', $line);
+                        }
+                        $this->last_ping = time();
+                        break;
+
+                    case 'PING':
+                        $this->last_ping = time();
+                        $this->out_damn(null, 'pong');
+                        break;
+
+                    case 'JOIN':
+                        $this->out_irc($this->damnnick, 'JOIN', '', $this->from_room($args[0]));
+                        // Error messages
+                        $line = $this->readline_damn();
+                        $this->debug('DAMN-JOIN', $line);
+                        break;
+
+                    case 'PART':
+                        $attributes = $this->read_attributes();
+                        $this->out_irc($this->damnnick, 'PART', $this->from_room($args[0]), isset($attributes['r']) ? $attributes['r'] : 'Gave up');
+                        break;
+
+                    case 'PROPERTY':
+                        $channel = $this->from_room($args[0]);
+                        if (!isset($this->channel_data[$channel])) {
+                            $this->channel_data[$channel] = array();
+                        }
+
+                        $attributes = $this->read_attributes();
+                        switch ($attributes['p']) {
+                            case 'topic':
+                                $this->channel_data[$channel]['topic'] = $this->readline_damn();
+                                break;
+                            case 'title':
+                                $this->channel_data[$channel]['title'] = $this->readline_damn();
+                                break;
+                            case 'privclasses':
+                                $this->channel_data[$channel]['privclasses'] = $this->read_attributes('1', ':');
+                                break;
+                            case 'members':
+                                $this->damn_currchan = $channel;
+                                break;
+                        }
+                        break;
+
+                    case 'MEMBER':
+                        $channel = $this->damn_currchan;
+                        if (!isset($this->channel_data[$channel]['members'])) {
+                            $this->channel_data[$channel]['members'] = array();
+                        }
+                        $this->channel_data[$channel]['members'][$args[0]] = $this->read_attributes();
+                        break;
+
+                    case 'RECV':
+                        $channel = $this->from_room($args[0]);
+
+                        // Discard blank line
+                        $this->readline_damn();
+                        $line = $this->readline_damn();
+
+                        list($subcmd, $submsg) = explode(' ', $line);
+                        switch ($subcmd) {
+                            case 'join':
+                                while ($line = $this->readline_damn()) {
+                                    // Who knows what "s=1" means...
+                                }
+                                $this->channel_data[$channel]['members'][$submsg] = $this->read_attributes('gpc');
+                                $this->out_irc($submsg, 'JOIN', '', $channel);
+                                break;
+
+                            case 'part':
+                                unset($this->channel_data[$channel]['members'][$submsg]);
+                                while ($line = $this->readline_damn()) {
+                                    // Again, discard the "s=1"
+                                }
+                                $this->out_irc($submsg, 'PART', $channel, 'Gave up');
+                                break;
+
+                            case 'msg':
+                                $attributes = $this->read_attributes();
+                                $input = $this->parse_recv_msg($this->readline_damn());
+                                if ($attributes['from'] == $this->damnnick) {
+                                    // Don't echo back stuff we know about
+                                } else {
+                                    $this->out_irc($attributes['from'], 'PRIVMSG', $channel, $input);
+                                }
+                                break;
+
+                            case 'action':
+                                $attributes = $this->read_attributes();
+                                $input = $this->parse_recv_msg($this->readline_damn());
+                                $this->out_irc($attributes['from'], 'PRIVMSG', $channel, "\001ACTION {$input}\001");
+                                break;
+                        }
+                }
+                $this->debug('DAMN', 'Command handled: '.strtoupper($msg), true);
+                break;
+        }
+    }
+
+    protected function readline_irc() {
+        return trim(fgets($this->listen_sockets[self::IRC_SOCK], 8192));
+    }
+
+    protected function readline_damn() {
+        $line = '';
+        $reading = true;
+        do {
+            $ch = fgetc($this->listen_sockets[self::DAMN_SOCK]);
+            if ($ch !== false) {
+                $reading = !in_array(ord($ch), array(0, 10));
+                $line .= $ch;
+            } else {
+                $reading = false;
+            }
+        } while ($reading);
+        return trim($line);
+    }
+
+    protected function to_mask($nick) {
+        return sprintf("%s!%s@%s", $nick, $nick, self::DAMN_HOST);
+    }
+
+    protected function to_room($str) {
+        switch ($str[0]) {
+            case '#':
+                return 'chat:' . substr($str, 1);
+            case '&':
+                return 'pchat:' . substr($str, 1);
+        }
+    }
+
+    protected function from_room($str) {
+        list($type, $name) = explode(':', $str);
+        switch ($type) {
+            case 'chat':
+                return '#'.$name;
+            case 'pchat':
+                return '&'.$name;
+        }
+    }
+
+    protected function read_attributes($last_attr = null, $split_char = '=') {
+        $attributes = array();
+
+        if (isset($last_attr)) {
+            while (true) {
+                $line = $this->readline_damn();
+                list($attr, $val) = explode($split_char, $line);
+                $attributes[$attr] = $val;
+                if ($attr == $last_attr) {
+                    break;
+                }
+            }
+        } else {
+            // We can watch for a blank line, which helps a little
+            while ($line = $this->readline_damn()) {
+                list($attr, $val) = explode($split_char, $line);
+                $attributes[$attr] = $val;
+            }
+        }
+
+        return $attributes;
+    }
+
+    protected function read_tablump($str, &$i, $count) {
+        // We start on the tab at the end of the command; advance
+        $i++;
+
+        $ret = array();
+        for ($x = 0; $x < $count; $x++) {
+            $out = '';
+            for (; $i < strlen($str) && !in_array(ord($str[$i]), array(38, 9)); $i++) {
+                $out .= $str[$i];
+            }
+            $ret[$x] = $out;
+            if ($i < strlen($str) && ord($str[$i]) == 9) {
+                $i++;
+            }
+        }
+        $i--;
+        $this->debug('DAMN', 'Tablump fields: '.json_encode($ret), true);
+        return $ret;
+    }
+
+    protected function parse_recv_msg($str) {
+        $out = '';
+        $this->debug('DAMN<-', $str, true);
+        for ($i = 0; $i < strlen($str); $i++) {
+            $c = ord($str[$i]);
+
+            if ($c == 38) {
+                $cmd = '';
+                while (++$i < strlen($str) && !in_array(ord($str[$i]), array(59, 9))) {
+                    $cmd .= $str[$i];
+                }
+
+                $this->debug('DAMN', 'Ran into a tablump: '.$cmd, true);
+                switch ($cmd) {
+                    // HTML entities
+                    case 'amp':
+                        $out .= '&';
+                        break;
+                    case 'lt':
+                        $out .= '<';
+                        break;
+                    case 'gt':
+                        $out .= '>';
+                        break;
+
+                    // Tablumps
+                    case 'thumb':
+                        $fields = $this->read_tablump($str, $i, 6);
+                        // TODO: Get a thumbnail for the deviationid
+                        break;
+
+                    case 'emote':
+                        $fields = $this->read_tablump($str, $i, 5);
+                        $out .= 'http://e.deviantart.net/emoticons/'.$fields[4].' ('.$fields[0].')';
+                        break;
+
+                    case 'avatar':
+                        $fields = $this->read_tablump($str, $i, 2);
+                        $out .= sprintf(
+                            'http://a.deviantart.net/avatars/%s/%s/%s.png?%d',
+                            $fields[0][0],
+                            $fields[0][1],
+                            $fields[0],
+                            $fields[1]
+                        );
+                        break;
+
+                    case 'abbr':
+                        $fields = $this->read_tablump($str, $i, 2);
+                        // Ignore abbreviations
+                        break;
+
+                    case 'link':
+                        $fields = $this->read_tablump($str, $i, 2);
+                        $out .= $fields[0];
+                        break;
+
+                    case 'i':
+                        $fields = $this->read_tablump($str, $i, 2);
+                        $out .= "\x1F{$fields[0]}\x0F";
+                        break;
+
+                    case 'b':
+                        $fields = $this->read_tablump($str, $i, 2);
+                        $out .= "\x02{$fields[0]}\x0F";
+                        break;
+
+                }
+            } else {
+                $out .= chr($c);
+            }
+        }
+        return $out;
+    }
+
+    protected function out_damn($code, $msg) {
+        $this->debug('DAMN->', sprintf('%s %s', $code, $msg), true);
+        if ($code) {
+            fprintf(
+                $this->listen_sockets[self::DAMN_SOCK], "%s %s\n\000",
+                $code,
+                $msg
+            );
+        } else {
+            fprintf(
+                $this->listen_sockets[self::DAMN_SOCK], "%s\n\000",
+                $msg
+            );
+        }
+    }
+
+    protected function out_irc($nick, $code, $prefix, $str) {
+        if ($nick) {
+            $mask = $this->to_mask($nick);
+        } else {
+            $mask = $this->options['irc_host'];
+        }
+        $this->debug('IRC->', sprintf('%s %s %s', $code, $prefix, $str), true);
+        fprintf(
+            $this->listen_sockets[self::IRC_SOCK], ":%s %s %s :%s\r\n",
+            $mask,
+            $code,
+            $prefix,
+            $str
+        );
+    }
+}
